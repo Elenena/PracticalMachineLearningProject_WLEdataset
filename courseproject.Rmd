@@ -1,0 +1,189 @@
+---
+title: "Human activity recognition on Weigth Lifting Exercices Dataset"
+author: "Elena Civati"
+date: "4/21/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Synopsis
+
+The goal of this project is to build a model to predict the manner in which an exercise was performed using data from accelerometers on the belt, forearm, arm, and dumbell of 6 young male healthy participants. While wearing sensors, they were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E).  
+For more details, see the original paper [Qualitative Activity Recognition of Weight Lifting Exercises](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201) from which the data were taken.  
+
+## Data cleaning and exploration
+
+```{r message=F, warning=F}
+if(!file.exists("training.csv")) {
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", "training.csv")}
+library(dplyr); library(caret); library(rattle); library(xtable); library(ggplot2); library(reshape2)
+library(gridExtra); library(randomForest); library(sessioninfo)
+set.seed(2410)
+```
+The original training dataset consists of 19622 measurements on 160 variables. Among those variables, 67 contain a majority of missing values as NAs, while 33 consist mostly of empty character strings, and thus have been removed.  
+Also, index of the measurements and date are not relevant for the purpose of our prediction model, as well as the new_window column that shows very little variance.
+Finally, character variables, among which the output of interest (the "classe" column) were converted in factors.
+
+```{r}
+training<-read.csv("training.csv")
+
+nacount<-apply(training,2, function(x) sum(is.na(x)))
+table(nacount)
+training<-training[,-which(nacount==19216)]
+
+emptycount<-apply(training,2, function(x) sum(x==""))
+table(emptycount)
+training<-training[,-which(emptycount==19216)]
+training<-training[,-c(1,5)]
+
+nearZeroVar(training)
+table(training$new_window)
+training<-training[,-4]
+
+char<-logical()
+for (i in 1:ncol(training)) {char[i]<-class(training[,i])=="character"}
+apply(training[,which(char)],2,unique)
+training<-mutate(training, user_name=as.factor(user_name), classe=as.factor(classe))
+```
+
+At this point, most of the remaining variables are sensors outputs, thus good candidate predictors. Only variables "num_window", "raw_timestamp_part_1" and "raw_timestamp_part_2" don't have a clear possible phisical relationship with the output. By plotting their relationship with "classe", I decided to remove the timestamp variables.  
+```{r fig.cap="Figure 1", fig.align="center"}
+par(mfrow=c(1,3))
+boxplot(training$num_window~training$classe, xlab="class", ylab=NULL, main="num_window")
+boxplot(training$raw_timestamp_part_1/1000~training$classe, 
+        ylim=range(training$raw_timestamp_part_1/1000),
+        xlab="class", ylab=NULL, main="raw_timestamp_part_1/1000")
+boxplot(training$raw_timestamp_part_2~training$classe,
+        xlab="class", ylab=NULL, main="raw_timestamp_part_2")
+training<-training[,-c(2,3)]
+```
+Concerning the "num_window" variable, although not evident from the plot, during model selection it turned out to be a perfect predictor when using the Random Forest method: in fact, it can alone predict with accuracy=1 all the data points in the training dataset. This indicates that, in a given window, only one type of exercise was performed, as one can verify with the tibble produced by the code below. So, this variable has to be removed if we want to obtain a meaningful model, telling us something about the relationship between the sensor measurements and the correctness of the exercise. 
+
+```{r}
+group_by(training, num_window) %>% summarize(classes=unique(classe))
+training<-training[,-2]
+```
+
+
+## Model selection and Cross validation
+
+In order to limit computing time in subsequent steps, I looked for other variables to exclude by examining the difference in average values, for each variable and for every possible pair of classes. I used t.test and reported the corresponding p values. Only 3 variables don't show significant difference in mean at $\alpha$=0.05 for any couple of classes, and there were removed from the list of predictors.
+
+```{r}
+couples<-combn(levels(training$classe),2)
+pvals<-matrix(NA,ncol(training[,-54]),ncol(couples))
+row.names(pvals)<-names(training[,-54])
+colnames(pvals)<-apply(couples,2, function(x) paste(x[1],x[2]))
+for (i in 1:nrow(pvals)) {
+    for (j in 1:ncol(pvals)) {
+        df<-filter(training, classe==couples[1,j]|classe==couples[2,j])[,c(i,54)]
+        pvals[i,j]<-round(t.test(as.numeric(df[,1]) ~ df$classe)$p.value,3)
+    }
+}
+minp<-apply(pvals,1,min)
+which(minp>=.05)
+training<-select(training, -c(19,21,46))
+```
+
+As  a starting point in model selection, a decision tree with method "rpart" was fitted. We can see that it uses only 4 predictors, ignoring the others, and doesn't have a very good performance. In particular, it completely fails in predicting the "D" class output.
+```{r fig.cap="Figure 2", fi.align="center"}
+fit_rpart<-train(classe~., data=training, method="rpart")
+fancyRpartPlot(fit_rpart$finalModel)
+fit_rpart$finalModel$frame$var[fit_rpart$finalModel$frame$var %in% names(training)]
+confusionMatrix(training$classe, predict(fit_rpart))$overall
+``` 
+
+To improve the accuracy, a more sophisticated method is required, and a greater number of predictors as well. My strategy was to fit a Random Forest model using, once again, the entire training dataset and all the 50 predictors, with the aim of ordering them based on their relative importance (using the Gini coefficent).  
+As shown by the confusion matrix, this model has an excellent performance on the training set, but it's far too complicated and it's not worth testing it via a cross validation technique.
+```{r eval=F, echo=1}
+fit_rf<-train(classe~., data=training, method="rf")
+saveRDS(fit_rf, "fit_rf.rds")
+```
+
+``` {r echo=-1, fig.cap="Figure 3", fig.align="center"}
+fit_rf<-readRDS("fit_rf.rds")
+confusionMatrix(training$classe, predict(fit_rf))$overall
+imp<-as.data.frame(fit_rf$finalModel$importance)
+imp<-arrange(imp, -MeanDecreaseGini)
+varImpPlot(fit_rf$finalModel, main="Variable importance")
+
+```
+The following step was to fit several Random Forest models with an increasing number of predictors, added one at a time according to the importance ranking previously established.
+As we are not provided a testing dataset with known outcomes, out of sample accuracy was estimated with a k-fold approach (5 iterations for each set of predictors tested).
+```{r eval=F}
+s<-sample(1:nrow(training))
+training_resampled<-training[s,]
+l<-floor(nrow(training)/5)
+mean_insample<-numeric()
+mean_outsample<-numeric()
+for(i in 1:50) {  #As the peak in out-of-sample accuracy was already achieved, the loop was interrupted at i=12 (after 13hrs of computation)
+    for (k in floor(seq(1,nrow(training), len=6))[-6]) {
+        insample<-numeric(); outsample<-numeric()
+        subtest<-select(training_resampled[k:(k+l),],c(row.names(imp)[1:i], classe))
+        subtrain<-select(training_resampled[-(k:(k+l)),],c(row.names(imp)[1:i], classe))
+        fit<-train(classe ~., data=subtrain, method="rf")
+        print(paste(Sys.time(),"i=",i,"k=",k)) 
+        insample<-c(insample,confusionMatrix(subtrain$classe, predict(fit))$overall[1])
+        outsample<-c(outsample, confusionMatrix(subtest$classe, predict(fit, subtest))$overall[1])
+        writeLines("insample"); print(insample)
+        writeLines("outsample"); print(outsample) #Some informations, here not shown, were printed out at the end of each loop, in order to supervise computation
+    }
+    mean_insample[i]<-mean(insample); mean_outsample[i]<-mean(outsample)
+    writeLines(paste("\ni=",i))
+    writeLines(c("\nmean_insample\n", mean_insample))
+    writeLines(c("\nmean_outsample\n", mean_outsample))
+}
+```
+
+``` {r echo=F, eval=F}   
+write.table(mean_insample, "mean_insample.txt"); write.table(mean_outsample, "mean_outsample.txt")
+```
+
+```{r echo=-c(1,2), results="asis"}
+mean_insample<-read.table("mean_insample.txt")
+mean_outsample<-read.table("mean_outsample.txt")
+tab<-cbind(1:nrow(mean_insample), round(mean_insample,4), round(mean_outsample,4))
+names(tab)<-c("Number_of_Predictors", "Training_Subset", "Testing_Subset")
+xt<-xtable(tab, caption="Table 1: Mean accuracy by numer of predictors", digits=4)
+print(xt, type="html")
+```
+
+
+```{r fig.cap="Figure 4", fig.align="center", fig.width=10}
+mtab<-melt(tab, id.vars="Number_of_Predictors", variable.name="Predictions_on", value.name="Accuracy")
+g1<-ggplot(mtab, aes(x=Number_of_Predictors, y=Accuracy, col=Predictions_on))+ geom_line()+geom_point(pch=19, col=rep(1:12,2), cex=2)+ geom_hline(yintercept=1)+ scale_x_continuous(breaks=1:12)+ ylab("Accuracy %")
+g2<-g1+coord_cartesian(ylim=c(0.97,1)) + geom_vline(xintercept = 9, lty=2)+ ggtitle(NULL, "Zoom")
+grid.arrange(g1, g2, ncol=2)
+```
+
+
+## Final model
+
+As shown, the best performance on a subset of data that was not used to train the model is about **99.1%** and corresponds to the use of the first **9** predictors with the greatest Gini index (even though with 4 predictors the accuracy would already be very good). Using more predictors would lead to really small changes in accuracy (see rightmost plot), while increasing computing time and reduce interpretability.  
+For those reasons, our final model will be a Random Forest model on the entire training dataset using the following predictors from the original dataset:
+```{r}
+row.names(imp)[1:9]
+```
+Here are the code and some parameters for this model:
+
+```{r eval=F, echo=1}
+fitFinal<-train(classe ~., data=select(training,c(row.names(imp)[1:9], classe)), method="rf")
+saveRDS(fitFinal, "fitFinal.rds")
+```
+
+``` {r echo=2}
+fitFinal<-readRDS("fitFinal.rds")
+fitFinal$finalModel
+```
+
+Applying this model to the small test dataset provided for the quiz gave the 100% of correct answers. On largest dataset the most optimistic estimate of out of sample accuracy is, as previously shown, about 99.1% and the expected out-of-bag error is 0.81%.
+
+The analysis was run with R 4.0.2 on a x86_64 Windows machine. Here are the versions of the most relevant packages used:
+```{r echo=F}
+p<-package_info(c("dplyr", "caret", "rattle", "xtable", "ggplot2", "reshape2", "gridExtra", "randomForest"),dependencies = F)
+cbind(p$package, p$loadedversion)
+```
+
+*Word count (according to the RStudio feature) =919*
